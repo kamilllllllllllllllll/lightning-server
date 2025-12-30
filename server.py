@@ -1,89 +1,65 @@
 import asyncio
 
-import json
+from starlette.applications import Starlette
 
-import websockets
+from starlette.routing import WebSocketRoute
 
-
-
-clients = {}  # username -> websocket
+from starlette.websockets import WebSocket
 
 
 
+connected_users = {}
 
 
-async def handler(websocket):
+
+async def websocket_endpoint(websocket: WebSocket):
+
+    await websocket.accept()
 
     username = None
 
     try:
 
-        async for message in websocket:
+        while True:
 
-            data = json.loads(message)
-
-
+            data = await websocket.receive_json()
 
             if data["type"] == "register":
 
                 username = data["username"]
 
-                clients[username] = websocket
+                if username in connected_users:
 
-                print(f"{username} connected")
+                    await websocket.send_json({"type": "error", "message": "Username taken"})
 
+                    continue
 
+                connected_users[username] = websocket
 
-            elif data["type"] == "send":
+                await websocket.send_json({"type": "success", "message": "Registered"})
 
-                to_user = data["to"]
+            elif data["type"] == "message":
 
-                if to_user in clients:
+                for user, ws in connected_users.items():
 
-                    await clients[to_user].send(json.dumps({
+                    if ws != websocket:
 
-                        "type": "message",
+                        await ws.send_json({"type": "message", "from": username, "text": data["text"]})
 
-                        "from": data["from"],
+    except Exception:
 
-                        "text": data["text"]
-
-                    }))
-
-
-
-    except websockets.exceptions.ConnectionClosed:
-
-        print("Connection closed")
-
-
+        pass
 
     finally:
 
-        if username and username in clients:
+        if username in connected_users:
 
-            del clients[username]
-
-            print(f"{username} disconnected")
+            del connected_users[username]
 
 
 
+app = Starlette(routes=[
 
+    WebSocketRoute("/ws", websocket_endpoint)
 
-async def main():
-
-    async with websockets.serve(handler, "0.0.0.0", 8000):
-
-        print("Server started on port 8000")
-
-        await asyncio.Future()
-
-
-
-
-
-if __name__ == "__main__":
-
-    asyncio.run(main())
-
-                    
+])
