@@ -59,7 +59,6 @@ async def ws_endpoint(websocket: WebSocket):
                     "users": list(connected_users.keys()),
                     "history": public_history
                 })
-
                 await broadcast({"type": "user_joined", "username": username}, exclude=websocket)
 
             elif t == "message":
@@ -79,20 +78,8 @@ async def ws_endpoint(websocket: WebSocket):
                     add_to_history(payload)
                     await broadcast(payload, exclude=websocket)
 
-            elif t == "typing":
-                to_user = (data.get("to") or "").strip()
-                is_typing = bool(data.get("is_typing", False))
-                payload = {"type": "typing", "from": username, "is_typing": is_typing}
-
-                if to_user:
-                    await send_to(to_user, payload)
-                else:
-                    await broadcast(payload, exclude=websocket)
-
             elif t == "voice":
-                # ✅ голосовое: всегда даём подтверждение отправителю
                 to_user = (data.get("to") or "").strip()
-
                 payload = {
                     "type": "voice",
                     "from": username,
@@ -100,7 +87,6 @@ async def ws_endpoint(websocket: WebSocket):
                     "sr": int(data.get("sr", 16000)),
                     "ch": int(data.get("ch", 1)),
                 }
-
                 if not payload["b64"]:
                     await websocket.send_json({"type": "error", "message": "Empty voice payload"})
                     continue
@@ -114,6 +100,29 @@ async def ws_endpoint(websocket: WebSocket):
                 else:
                     await broadcast(payload, exclude=websocket)
                     await websocket.send_json({"type": "voice_sent", "to": ""})
+
+            # ✅ typing / recording status
+            elif t == "presence":
+                # data: {type:"presence", kind:"typing"|"recording", is_on:bool, to:""(optional)}
+                kind = (data.get("kind") or "").strip()
+                is_on = bool(data.get("is_on", False))
+                to_user = (data.get("to") or "").strip()
+
+                if kind not in ("typing", "recording"):
+                    continue
+
+                payload = {
+                    "type": "presence",
+                    "kind": kind,
+                    "from": username,
+                    "is_on": is_on,
+                    "to": to_user  # чтобы клиент понимал контекст (общий/личка)
+                }
+
+                if to_user:
+                    await send_to(to_user, payload)
+                else:
+                    await broadcast(payload, exclude=websocket)
 
     except Exception:
         pass
