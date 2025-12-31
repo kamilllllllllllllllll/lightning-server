@@ -3,10 +3,8 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
-# username -> WebSocket
 connected_users: dict[str, WebSocket] = {}
 
-# история общего чата (последние N сообщений)
 MAX_HISTORY = 100
 public_history: list[dict] = []
 
@@ -44,22 +42,13 @@ async def ws_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             t = data.get("type")
 
-            # ===== REGISTRATION =====
             if t == "register":
                 username = (data.get("username") or "").strip()
-
                 if not username:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Username required"
-                    })
+                    await websocket.send_json({"type": "error", "message": "Username required"})
                     continue
-
                 if username in connected_users:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Username already taken"
-                    })
+                    await websocket.send_json({"type": "error", "message": "Username already taken"})
                     continue
 
                 connected_users[username] = websocket
@@ -71,58 +60,37 @@ async def ws_endpoint(websocket: WebSocket):
                     "history": public_history
                 })
 
-                await broadcast(
-                    {"type": "user_joined", "username": username},
-                    exclude=websocket
-                )
+                await broadcast({"type": "user_joined", "username": username}, exclude=websocket)
 
-            # ===== TEXT MESSAGE =====
             elif t == "message":
                 text = (data.get("text") or "").strip()
                 to_user = (data.get("to") or "").strip()
-
                 if not text:
                     continue
 
                 if to_user:
-                    ok = await send_to(
-                        to_user,
-                        {"type": "pm", "from": username, "text": text}
-                    )
+                    ok = await send_to(to_user, {"type": "pm", "from": username, "text": text})
                     if ok:
-                        await websocket.send_json({
-                            "type": "pm_sent",
-                            "to": to_user,
-                            "text": text
-                        })
+                        await websocket.send_json({"type": "pm_sent", "to": to_user, "text": text})
                     else:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"User @{to_user} is not online"
-                        })
+                        await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
                 else:
                     payload = {"type": "message", "from": username, "text": text}
                     add_to_history(payload)
                     await broadcast(payload, exclude=websocket)
 
-            # ===== TYPING =====
             elif t == "typing":
                 to_user = (data.get("to") or "").strip()
                 is_typing = bool(data.get("is_typing", False))
-
-                payload = {
-                    "type": "typing",
-                    "from": username,
-                    "is_typing": is_typing
-                }
+                payload = {"type": "typing", "from": username, "is_typing": is_typing}
 
                 if to_user:
                     await send_to(to_user, payload)
                 else:
                     await broadcast(payload, exclude=websocket)
 
-            # ===== VOICE MESSAGE =====
             elif t == "voice":
+                # ✅ голосовое: всегда даём подтверждение отправителю
                 to_user = (data.get("to") or "").strip()
 
                 payload = {
@@ -134,33 +102,25 @@ async def ws_endpoint(websocket: WebSocket):
                 }
 
                 if not payload["b64"]:
+                    await websocket.send_json({"type": "error", "message": "Empty voice payload"})
                     continue
 
                 if to_user:
                     ok = await send_to(to_user, payload)
                     if ok:
-                        await websocket.send_json({
-                            "type": "voice_sent",
-                            "to": to_user
-                        })
+                        await websocket.send_json({"type": "voice_sent", "to": to_user})
                     else:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"User @{to_user} is not online"
-                        })
+                        await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
                 else:
                     await broadcast(payload, exclude=websocket)
+                    await websocket.send_json({"type": "voice_sent", "to": ""})
 
     except Exception:
         pass
-
     finally:
         if username and connected_users.get(username) is websocket:
             del connected_users[username]
-            await broadcast({
-                "type": "user_left",
-                "username": username
-            })
+            await broadcast({"type": "user_left", "username": username})
 
 
 app = Starlette(routes=[
