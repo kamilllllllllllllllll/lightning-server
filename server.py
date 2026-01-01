@@ -483,3 +483,49 @@ async def ws_endpoint(websocket: WebSocket):
                         "to": to_user
 
                     })
+
+
+
+    except WebSocketDisconnect:
+
+        pass
+
+    except Exception:
+
+        pass
+
+    finally:
+
+        if username and connected_users.get(username) is websocket:
+
+            del connected_users[username]
+
+            await broadcast({"type": "user_left", "username": username})
+
+
+
+
+
+# ================== APP ==================
+
+app = Starlette(routes=[
+
+    Route("/", homepage),
+
+    Route("/signup", signup, methods=["POST"]),
+
+    Route("/login", login, methods=["POST"]),
+
+    WebSocketRoute("/ws", ws_endpoint),
+
+])
+
+
+
+
+
+@app.on_event("startup")
+
+async def on_startup():
+
+    await init_db()
