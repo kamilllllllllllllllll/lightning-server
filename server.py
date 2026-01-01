@@ -1,10 +1,6 @@
 import os
 
-import json
-
 import time
-
-import asyncio
 
 from typing import Optional, Dict
 
@@ -24,7 +20,7 @@ from starlette.responses import PlainTextResponse, JSONResponse
 
 from starlette.routing import Route, WebSocketRoute
 
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 
 
@@ -48,7 +44,7 @@ db_pool: Optional[asyncpg.Pool] = None
 
 
 
-# ---------- DB ----------
+# ---------------- DB ----------------
 
 async def init_db():
 
@@ -82,8 +78,6 @@ async def init_db():
 
         """)
 
-        # messages table будет на следующем шаге (история/диалоги)
-
 
 
 
@@ -92,15 +86,7 @@ def create_token(username: str) -> str:
 
     now = int(time.time())
 
-    payload = {
-
-        "sub": username,
-
-        "iat": now,
-
-        "exp": now + 60 * 60 * 24 * 30,  # 30 дней
-
-    }
+    payload = {"sub": username, "iat": now, "exp": now + 60 * 60 * 24 * 30}
 
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
@@ -138,7 +124,13 @@ async def get_user_by_email(email: str):
 
     async with db_pool.acquire() as conn:
 
-        return await conn.fetchrow("SELECT id, email, username, password_hash FROM users WHERE email=$1", email)
+        return await conn.fetchrow(
+
+            "SELECT id, email, username, password_hash FROM users WHERE email=$1",
+
+            email
+
+        )
 
 
 
@@ -162,7 +154,7 @@ async def create_user(email: str, username: str, password: str):
 
 
 
-# ---------- HTTP ----------
+# ---------------- HTTP ----------------
 
 async def homepage(request):
 
@@ -190,11 +182,9 @@ async def signup(request):
 
 
 
-    # простая валидация
+    if "@" not in email or len(username) < 3 or len(password) < 6:
 
-    if "@" not in email or len(password) < 6 or len(username) < 3:
-
-        return JSONResponse({"ok": False, "error": "invalid email/username/password"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "invalid input"}, status_code=400)
 
 
 
@@ -254,7 +244,7 @@ async def login(request):
 
 
 
-# ---------- WS helpers ----------
+# ---------------- WS helpers ----------------
 
 async def send_to(username: str, payload: dict) -> bool:
 
@@ -284,19 +274,19 @@ async def broadcast(payload: dict, exclude: WebSocket | None = None):
 
 
 
-# ---------- WS endpoint ----------
+# ---------------- WS endpoint ----------------
 
 async def ws_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    username = None
+    username: Optional[str] = None
 
 
 
     try:
 
-        # 1) ждём auth
+        # first message must be auth
 
         first = await websocket.receive_json()
 
@@ -322,3 +312,164 @@ async def ws_endpoint(websocket: WebSocket):
 
             return
 
+
+
+        # ensure user exists in DB
+
+        user_row = await get_user_by_username(username)
+
+        if not user_row:
+
+            await websocket.send_json({"type": "error", "message": "User not found"})
+
+            await websocket.close()
+
+            return
+
+
+
+        # prevent duplicate online sessions
+
+        if username in connected_users:
+
+            await websocket.send_json({"type": "error", "message": "Already online"})
+
+            await websocket.close()
+
+            return
+
+
+
+        connected_users[username] = websocket
+
+
+
+        await websocket.send_json({
+
+            "type": "success",
+
+            "message": "Authorized",
+
+            "username": username,
+
+            "users": list(connected_users.keys())
+
+        })
+
+        await broadcast({"type": "user_joined", "username": username}, exclude=websocket)
+
+
+
+        while True:
+
+            data = await websocket.receive_json()
+
+            t = data.get("type")
+
+
+
+            if t == "message":
+
+                text = (data.get("text") or "").strip()
+
+                to_user = (data.get("to") or "").strip()
+
+                if text and to_user:
+
+                    await send_to(to_user, {"type": "pm", "from": username, "text": text})
+
+
+
+            elif t == "voice":
+
+                to_user = (data.get("to") or "").strip()
+
+                b64 = data.get("b64", "")
+
+                if to_user and b64:
+
+                    payload = {
+
+                        "type": "voice",
+
+                        "from": username,
+
+                        "b64": b64,
+
+                        "sr": int(data.get("sr", 16000)),
+
+                        "ch": int(data.get("ch", 1)),
+
+                    }
+
+                    await send_to(to_user, payload)
+
+
+
+            elif t == "presence":
+
+                kind = (data.get("kind") or "").strip()
+
+                is_on = bool(data.get("is_on", False))
+
+                to_user = (data.get("to") or "").strip()
+
+                if kind in ("typing", "recording") and to_user:
+
+                    await send_to(to_user, {
+
+                        "type": "presence",
+
+                        "kind": kind,
+
+                        "from": username,
+
+                        "is_on": is_on,
+
+                        "to": to_user
+
+                    })
+
+
+
+    except WebSocketDisconnect:
+
+        pass
+
+    except Exception:
+
+        pass
+
+    finally:
+
+        if username and connected_users.get(username) is websocket:
+
+            del connected_users[username]
+
+            await broadcast({"type": "user_left", "username": username})
+
+
+
+
+
+app = Starlette(routes=[
+
+    Route("/", homepage),
+
+    Route("/signup", signup, methods=["POST"]),
+
+    Route("/login", login, methods=["POST"]),
+
+    WebSocketRoute("/ws", ws_endpoint),
+
+])
+
+
+
+
+
+@app.on_event("startup")
+
+async def on_startup():
+
+    await init_db()
