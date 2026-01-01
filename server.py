@@ -158,8 +158,7 @@ async def create_user(email: str, username: str, password: str):
 
 async def homepage(request):
 
-    return PlainTextResponse("OK - Lightning server is running")
-
+    return PlainTextResponse("OK - Lightning server v2 (AUTH+DB)")
 
 
 
@@ -473,3 +472,4 @@ app = Starlette(routes=[
 async def on_startup():
 
     await init_db()
+
