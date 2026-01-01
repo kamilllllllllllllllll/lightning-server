@@ -1,2 +1,5 @@
 starlette
 uvicorn[standard]
+asyncpg
+passlib[bcrypt]
+PyJWT
