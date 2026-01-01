@@ -40,7 +40,9 @@ JWT_ALG = "HS256"
 
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# ✅ ВАЖНО: используем PBKDF2 вместо bcrypt (нет лимита 72 байта)
+
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 
 
@@ -156,7 +158,7 @@ def create_token(username: str) -> str:
 
     now = int(time.time())
 
-    payload = {"sub": username, "iat": now, "exp": now + 60 * 60 * 24 * 30}  # 30 дней
+    payload = {"sub": username, "iat": now, "exp": now + 60 * 60 * 24 * 30}
 
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
@@ -184,7 +186,7 @@ def verify_token(token: str) -> Optional[str]:
 
 async def homepage(request):
 
-    return PlainTextResponse("OK - Lightning server v2 (AUTH+DB)")
+    return PlainTextResponse("OK - Lightning server v3 (AUTH+DB+PBKDF2)")
 
 
 
@@ -239,8 +241,6 @@ async def signup(request):
 
 
     except Exception:
-
-        # ✅ ВСЕГДА вернём JSON с причиной
 
         return JSONResponse(
 
@@ -374,8 +374,6 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 
-        # ensure user exists
-
         row = await get_user_by_username(username)
 
         if not row:
@@ -485,51 +483,3 @@ async def ws_endpoint(websocket: WebSocket):
                         "to": to_user
 
                     })
-
-
-
-    except WebSocketDisconnect:
-
-        pass
-
-    except Exception:
-
-        # не спамим, просто закрываем
-
-        pass
-
-    finally:
-
-        if username and connected_users.get(username) is websocket:
-
-            del connected_users[username]
-
-            await broadcast({"type": "user_left", "username": username})
-
-
-
-
-
-# ================== APP ==================
-
-app = Starlette(routes=[
-
-    Route("/", homepage),
-
-    Route("/signup", signup, methods=["POST"]),
-
-    Route("/login", login, methods=["POST"]),
-
-    WebSocketRoute("/ws", ws_endpoint),
-
-])
-
-
-
-
-
-@app.on_event("startup")
-
-async def on_startup():
-
-    await init_db()
