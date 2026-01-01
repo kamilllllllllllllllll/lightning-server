@@ -2,11 +2,17 @@ import os
 
 import time
 
+import traceback
+
 from typing import Optional, Dict
 
 
 
 import asyncpg
+
+from asyncpg.exceptions import UniqueViolationError
+
+
 
 import jwt
 
@@ -23,6 +29,8 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 
+
+# ================== CONFIG ==================
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -44,7 +52,7 @@ db_pool: Optional[asyncpg.Pool] = None
 
 
 
-# ---------------- DB ----------------
+# ================== DB ==================
 
 async def init_db():
 
@@ -52,7 +60,9 @@ async def init_db():
 
     if not DATABASE_URL:
 
-        raise RuntimeError("DATABASE_URL is not set")
+        raise RuntimeError("DATABASE_URL is not set (Render -> Environment Variables)")
+
+
 
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
@@ -82,11 +92,71 @@ async def init_db():
 
 
 
+async def create_user(email: str, username: str, password: str):
+
+    password_hash = pwd_context.hash(password)
+
+    async with db_pool.acquire() as conn:
+
+        return await conn.fetchrow(
+
+            """
+
+            INSERT INTO users (email, username, password_hash)
+
+            VALUES ($1, $2, $3)
+
+            RETURNING id, email, username
+
+            """,
+
+            email, username, password_hash
+
+        )
+
+
+
+
+
+async def get_user_by_email(email: str):
+
+    async with db_pool.acquire() as conn:
+
+        return await conn.fetchrow(
+
+            "SELECT id, email, username, password_hash FROM users WHERE email=$1",
+
+            email
+
+        )
+
+
+
+
+
+async def get_user_by_username(username: str):
+
+    async with db_pool.acquire() as conn:
+
+        return await conn.fetchrow(
+
+            "SELECT id, email, username FROM users WHERE username=$1",
+
+            username
+
+        )
+
+
+
+
+
+# ================== JWT ==================
+
 def create_token(username: str) -> str:
 
     now = int(time.time())
 
-    payload = {"sub": username, "iat": now, "exp": now + 60 * 60 * 24 * 30}
+    payload = {"sub": username, "iat": now, "exp": now + 60 * 60 * 24 * 30}  # 30 дней
 
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
@@ -110,55 +180,11 @@ def verify_token(token: str) -> Optional[str]:
 
 
 
-async def get_user_by_username(username: str):
-
-    async with db_pool.acquire() as conn:
-
-        return await conn.fetchrow("SELECT id, email, username FROM users WHERE username=$1", username)
-
-
-
-
-
-async def get_user_by_email(email: str):
-
-    async with db_pool.acquire() as conn:
-
-        return await conn.fetchrow(
-
-            "SELECT id, email, username, password_hash FROM users WHERE email=$1",
-
-            email
-
-        )
-
-
-
-
-
-async def create_user(email: str, username: str, password: str):
-
-    password_hash = pwd_context.hash(password)
-
-    async with db_pool.acquire() as conn:
-
-        return await conn.fetchrow(
-
-            "INSERT INTO users(email, username, password_hash) VALUES($1,$2,$3) RETURNING id, email, username",
-
-            email, username, password_hash
-
-        )
-
-
-
-
-
-# ---------------- HTTP ----------------
+# ================== HTTP ==================
 
 async def homepage(request):
 
-    return PlainTextResponse("OK - Lightning server is running")
+    return PlainTextResponse("OK - Lightning server v2 (AUTH+DB)")
 
 
 
@@ -166,41 +192,63 @@ async def homepage(request):
 
 async def signup(request):
 
-    data = await request.json()
-
-    email = (data.get("email") or "").strip().lower()
-
-    username = (data.get("username") or "").strip()
-
-    password = (data.get("password") or "")
-
-
-
-    if not email or not username or not password:
-
-        return JSONResponse({"ok": False, "error": "email/username/password required"}, status_code=400)
-
-
-
-    if "@" not in email or len(username) < 3 or len(password) < 6:
-
-        return JSONResponse({"ok": False, "error": "invalid input"}, status_code=400)
-
-
-
     try:
+
+        data = await request.json()
+
+        email = (data.get("email") or "").strip().lower()
+
+        username = (data.get("username") or "").strip()
+
+        password = (data.get("password") or "")
+
+
+
+        if not email or not username or not password:
+
+            return JSONResponse({"ok": False, "error": "email/username/password required"}, status_code=400)
+
+
+
+        if "@" not in email:
+
+            return JSONResponse({"ok": False, "error": "invalid email"}, status_code=400)
+
+        if len(username) < 3:
+
+            return JSONResponse({"ok": False, "error": "username must be >= 3 chars"}, status_code=400)
+
+        if len(password) < 6:
+
+            return JSONResponse({"ok": False, "error": "password must be >= 6 chars"}, status_code=400)
+
+
 
         user = await create_user(email, username, password)
 
-    except asyncpg.UniqueViolationError:
+        token = create_token(user["username"])
+
+        return JSONResponse({"ok": True, "token": token, "username": user["username"]}, status_code=200)
+
+
+
+    except UniqueViolationError:
 
         return JSONResponse({"ok": False, "error": "email or username already taken"}, status_code=409)
 
 
 
-    token = create_token(user["username"])
+    except Exception:
 
-    return JSONResponse({"ok": True, "token": token, "username": user["username"]})
+        # ✅ ВСЕГДА вернём JSON с причиной
+
+        return JSONResponse(
+
+            {"ok": False, "error": "signup failed", "detail": traceback.format_exc()},
+
+            status_code=500
+
+        )
 
 
 
@@ -208,43 +256,57 @@ async def signup(request):
 
 async def login(request):
 
-    data = await request.json()
+    try:
 
-    email = (data.get("email") or "").strip().lower()
+        data = await request.json()
 
-    password = (data.get("password") or "")
+        email = (data.get("email") or "").strip().lower()
 
-
-
-    if not email or not password:
-
-        return JSONResponse({"ok": False, "error": "email/password required"}, status_code=400)
+        password = (data.get("password") or "")
 
 
 
-    row = await get_user_by_email(email)
+        if not email or not password:
 
-    if not row:
-
-        return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
+            return JSONResponse({"ok": False, "error": "email/password required"}, status_code=400)
 
 
 
-    if not pwd_context.verify(password, row["password_hash"]):
+        row = await get_user_by_email(email)
 
-        return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
+        if not row:
 
-
-
-    token = create_token(row["username"])
-
-    return JSONResponse({"ok": True, "token": token, "username": row["username"]})
+            return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
 
 
 
+        if not pwd_context.verify(password, row["password_hash"]):
+
+            return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
 
 
-# ---------------- WS helpers ----------------
+
+        token = create_token(row["username"])
+
+        return JSONResponse({"ok": True, "token": token, "username": row["username"]}, status_code=200)
+
+
+
+    except Exception:
+
+        return JSONResponse(
+
+            {"ok": False, "error": "login failed", "detail": traceback.format_exc()},
+
+            status_code=500
+
+        )
+
+
+
+
+
+# ================== WS HELPERS ==================
 
 async def send_to(username: str, payload: dict) -> bool:
 
@@ -274,7 +336,7 @@ async def broadcast(payload: dict, exclude: WebSocket | None = None):
 
 
 
-# ---------------- WS endpoint ----------------
+# ================== WS ==================
 
 async def ws_endpoint(websocket: WebSocket):
 
@@ -285,8 +347,6 @@ async def ws_endpoint(websocket: WebSocket):
 
 
     try:
-
-        # first message must be auth
 
         first = await websocket.receive_json()
 
@@ -314,11 +374,11 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 
-        # ensure user exists in DB
+        # ensure user exists
 
-        user_row = await get_user_by_username(username)
+        row = await get_user_by_username(username)
 
-        if not user_row:
+        if not row:
 
             await websocket.send_json({"type": "error", "message": "User not found"})
 
@@ -327,8 +387,6 @@ async def ws_endpoint(websocket: WebSocket):
             return
 
 
-
-        # prevent duplicate online sessions
 
         if username in connected_users:
 
@@ -388,7 +446,7 @@ async def ws_endpoint(websocket: WebSocket):
 
                 if to_user and b64:
 
-                    payload = {
+                    await send_to(to_user, {
 
                         "type": "voice",
 
@@ -400,9 +458,7 @@ async def ws_endpoint(websocket: WebSocket):
 
                         "ch": int(data.get("ch", 1)),
 
-                    }
-
-                    await send_to(to_user, payload)
+                    })
 
 
 
@@ -438,6 +494,8 @@ async def ws_endpoint(websocket: WebSocket):
 
     except Exception:
 
+        # не спамим, просто закрываем
+
         pass
 
     finally:
@@ -451,6 +509,8 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 
+
+# ================== APP ==================
 
 app = Starlette(routes=[
 
