@@ -4,6 +4,7 @@ import time
 import uuid
 import traceback
 from typing import Dict, Optional
+from datetime import datetime, timezone
 
 import asyncpg
 import jwt
@@ -21,23 +22,19 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "dev_secret_change_me")
 JWT_ALG = os.environ.get("JWT_ALG", "HS256")
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "2592000"))  # 30 days
 
-# Password hashing (no 72-byte limit) + allow old bcrypt hashes if exist
 pwd_context = CryptContext(
     schemes=["pbkdf2_sha256", "bcrypt"],
     deprecated="auto",
 )
 
-# =====================
-# DB + WS STATE
-# =====================
 pool: Optional[asyncpg.Pool] = None
 connected_users: Dict[str, WebSocket] = {}
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 
-def now_ts() -> int:
-    return int(time.time())
+def utcnow():
+    return datetime.now(timezone.utc)
 
 
 def new_id(prefix: str) -> str:
@@ -48,7 +45,7 @@ def new_id(prefix: str) -> str:
 # JWT
 # =====================
 def make_token(username: str) -> str:
-    iat = now_ts()
+    iat = int(time.time())
     exp = iat + TOKEN_TTL_SECONDS
     payload = {"sub": username, "iat": iat, "exp": exp}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
@@ -64,13 +61,9 @@ def username_from_token(token: str) -> Optional[str]:
 
 
 # =====================
-# DB
+# DB init + migrations
 # =====================
 async def init_db():
-    """
-    Creates users table if not exists.
-    IMPORTANT: email is NOT unique (we migrate old unique constraint away).
-    """
     global pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
@@ -78,7 +71,8 @@ async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with pool.acquire() as conn:
-        # Create table (email is NOT unique)
+        # 1) Создаём таблицу если нет.
+        # created_at сразу делаем timestamptz (это самый удобный и правильный вариант)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -86,21 +80,39 @@ async def init_db():
                 email TEXT,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
-                created_at BIGINT NOT NULL
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
 
-        # ---- MIGRATION: remove old UNIQUE constraint/index on email (if existed) ----
-        # Postgres typical constraint name for UNIQUE(email) is users_email_key
+        # 2) MIGRATION: убрать UNIQUE с email (если было раньше)
         await conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;")
         await conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_unique;")
-
-        # Also drop possible unique index names (just in case)
         await conn.execute("DROP INDEX IF EXISTS users_email_key;")
         await conn.execute("DROP INDEX IF EXISTS idx_users_email_unique;")
 
-        # Create non-unique index to speed up lookups (optional)
+        # 3) MIGRATION: если created_at был BIGINT — конвертируем в TIMESTAMPTZ
+        # Проверим тип поля
+        col_type = await conn.fetchval(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_name='users' AND column_name='created_at'
+            """
+        )
+
+        # information_schema для timestamptz может вернуть 'timestamp with time zone'
+        if col_type and col_type.lower() in ("bigint", "integer"):
+            # BIGINT epoch seconds -> timestamptz
+            await conn.execute(
+                """
+                ALTER TABLE users
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ
+                USING to_timestamp(created_at);
+                """
+            )
+
+        # 4) Индекс на email (не уникальный)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
 
 
@@ -126,7 +138,7 @@ async def db_create_user(email: Optional[str], username: str, password: str) -> 
                 VALUES($1, $2, $3, $4)
                 RETURNING id, email, username, created_at
                 """,
-                email, username, password_hash, now_ts(),
+                email, username, password_hash, utcnow(),  # ✅ datetime, не int
             )
             return dict(row)
         except asyncpg.UniqueViolationError:
@@ -134,18 +146,13 @@ async def db_create_user(email: Optional[str], username: str, password: str) -> 
 
 
 # =====================
-# HTTP ROUTES
+# HTTP
 # =====================
 async def homepage(request):
     return PlainTextResponse("OK - Lightning server is running")
 
 
 async def signup(request):
-    """
-    POST /signup
-    JSON: {"email":"(optional)", "username":"...", "password":"..."}
-    email НЕ проверяем на уникальность и не валидируем строго.
-    """
     try:
         body = await request.json()
         email = (body.get("email") or "").strip() or None
@@ -168,10 +175,6 @@ async def signup(request):
 
 
 async def login(request):
-    """
-    POST /login
-    JSON: {"username":"...", "password":"..."}
-    """
     try:
         body = await request.json()
         username = (body.get("username") or "").strip()
@@ -193,7 +196,7 @@ async def login(request):
 
 
 # =====================
-# WS HELPERS
+# WS helpers
 # =====================
 async def send_to(username: str, payload: dict) -> bool:
     ws = connected_users.get(username)
@@ -210,7 +213,7 @@ async def broadcast(payload: dict, exclude: Optional[WebSocket] = None):
 
 
 # =====================
-# WS ENDPOINT
+# WS
 # =====================
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -221,7 +224,6 @@ async def ws_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             t = (data.get("type") or "").strip()
 
-            # --- auth ---
             if t == "auth":
                 token = (data.get("token") or "").strip()
                 u = username_from_token(token)
@@ -242,7 +244,6 @@ async def ws_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "Not authorized"})
                 continue
 
-            # --- message ---
             if t == "message":
                 to_user = (data.get("to") or "").strip()
                 text = (data.get("text") or "").strip()
@@ -251,16 +252,15 @@ async def ws_endpoint(websocket: WebSocket):
                     continue
 
                 msg_id = new_id("m")
-                payload = {"type": "pm", "id": msg_id, "from": authed_username, "to": to_user, "text": text, "ts": now_ts()}
-
+                payload = {"type": "pm", "id": msg_id, "from": authed_username, "to": to_user, "text": text, "ts": int(time.time())}
                 ok = await send_to(to_user, payload)
+
                 if ok:
                     await websocket.send_json({"type": "pm_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
                 else:
                     await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
                 continue
 
-            # --- voice ---
             if t == "voice":
                 to_user = (data.get("to") or "").strip()
                 b64 = data.get("b64") or ""
@@ -271,16 +271,15 @@ async def ws_endpoint(websocket: WebSocket):
                     continue
 
                 msg_id = new_id("v")
-                payload = {"type": "voice", "id": msg_id, "from": authed_username, "to": to_user, "b64": b64, "sr": sr, "ch": ch, "ts": now_ts()}
-
+                payload = {"type": "voice", "id": msg_id, "from": authed_username, "to": to_user, "b64": b64, "sr": sr, "ch": ch, "ts": int(time.time())}
                 ok = await send_to(to_user, payload)
+
                 if ok:
                     await websocket.send_json({"type": "voice_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
                 else:
                     await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
                 continue
 
-            # --- presence ---
             if t == "presence":
                 kind = (data.get("kind") or "").strip()
                 is_on = bool(data.get("is_on", False))
@@ -288,38 +287,6 @@ async def ws_endpoint(websocket: WebSocket):
                 if kind not in ("typing", "recording") or not to_user:
                     continue
                 await send_to(to_user, {"type": "presence", "kind": kind, "from": authed_username, "is_on": is_on, "to": to_user})
-                continue
-
-            # --- edit ---
-            if t == "edit":
-                to_user = (data.get("to") or "").strip()
-                msg_id = (data.get("id") or "").strip()
-                new_text = (data.get("new_text") or "").strip()
-                if not to_user or not msg_id or not new_text:
-                    continue
-                payload = {"type": "edit", "id": msg_id, "from": authed_username, "to": to_user, "new_text": new_text, "edited_ts": now_ts()}
-                await send_to(to_user, payload)
-                await websocket.send_json(payload)
-                continue
-
-            # --- delete for both ---
-            if t == "delete_for_both":
-                to_user = (data.get("to") or "").strip()
-                msg_id = (data.get("id") or "").strip()
-                if not to_user or not msg_id:
-                    continue
-                payload = {"type": "delete_for_both", "id": msg_id, "from": authed_username, "to": to_user}
-                await send_to(to_user, payload)
-                await websocket.send_json(payload)
-                continue
-
-            # --- read receipts ---
-            if t == "read":
-                to_user = (data.get("to") or "").strip()
-                upto_id = (data.get("upto_id") or "").strip()
-                if not to_user or not upto_id:
-                    continue
-                await send_to(to_user, {"type": "read", "from": authed_username, "to": to_user, "upto_id": upto_id, "ts": now_ts()})
                 continue
 
     except Exception:
@@ -330,9 +297,6 @@ async def ws_endpoint(websocket: WebSocket):
             await broadcast({"type": "user_left", "username": authed_username})
 
 
-# =====================
-# LIFESPAN
-# =====================
 async def on_startup():
     await init_db()
 
