@@ -22,12 +22,15 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "dev_secret_change_me")
 JWT_ALG = os.environ.get("JWT_ALG", "HS256")
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "2592000"))  # 30 days
 
+# Пароль: bcrypt + fallback pbkdf2_sha256
 pwd_context = CryptContext(
     schemes=["pbkdf2_sha256", "bcrypt"],
     deprecated="auto",
 )
 
 pool: Optional[asyncpg.Pool] = None
+
+# online map
 connected_users: Dict[str, WebSocket] = {}
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
@@ -71,8 +74,7 @@ async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with pool.acquire() as conn:
-        # 1) Создаём таблицу если нет.
-        # created_at сразу делаем timestamptz (это самый удобный и правильный вариант)
+        # Таблица users
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -85,14 +87,13 @@ async def init_db():
             """
         )
 
-        # 2) MIGRATION: убрать UNIQUE с email (если было раньше)
+        # email НЕ уникальный
         await conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;")
         await conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_unique;")
         await conn.execute("DROP INDEX IF EXISTS users_email_key;")
         await conn.execute("DROP INDEX IF EXISTS idx_users_email_unique;")
 
-        # 3) MIGRATION: если created_at был BIGINT — конвертируем в TIMESTAMPTZ
-        # Проверим тип поля
+        # migration created_at если был bigint/integer
         col_type = await conn.fetchval(
             """
             SELECT data_type
@@ -100,10 +101,7 @@ async def init_db():
             WHERE table_name='users' AND column_name='created_at'
             """
         )
-
-        # information_schema для timestamptz может вернуть 'timestamp with time zone'
         if col_type and col_type.lower() in ("bigint", "integer"):
-            # BIGINT epoch seconds -> timestamptz
             await conn.execute(
                 """
                 ALTER TABLE users
@@ -112,7 +110,6 @@ async def init_db():
                 """
             )
 
-        # 4) Индекс на email (не уникальный)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
 
 
@@ -128,6 +125,11 @@ async def db_create_user(email: Optional[str], username: str, password: str) -> 
     if pool is None:
         raise RuntimeError("DB pool is not initialized")
 
+    # bcrypt ограничение ~72 bytes — лучше режем и сразу предупреждаем на клиенте,
+    # но на сервере тоже защитимся:
+    if len(password.encode("utf-8")) > 72:
+        raise ValueError("password too long (max ~72 bytes for bcrypt)")
+
     password_hash = pwd_context.hash(password)
 
     async with pool.acquire() as conn:
@@ -138,7 +140,7 @@ async def db_create_user(email: Optional[str], username: str, password: str) -> 
                 VALUES($1, $2, $3, $4)
                 RETURNING id, email, username, created_at
                 """,
-                email, username, password_hash, utcnow(),  # ✅ datetime, не int
+                email, username, password_hash, utcnow(),  # ✅ datetime
             )
             return dict(row)
         except asyncpg.UniqueViolationError:
@@ -163,13 +165,17 @@ async def signup(request):
             return JSONResponse({"ok": False, "error": "invalid username (3-20, A-Z 0-9 _)"}, status_code=400)
         if len(password) < 6:
             return JSONResponse({"ok": False, "error": "password too short (min 6)"}, status_code=400)
+        if len(password.encode("utf-8")) > 72:
+            return JSONResponse({"ok": False, "error": "password too long (max ~72 bytes)"}, status_code=400)
 
         user = await db_create_user(email, username, password)
         token = make_token(user["username"])
         return JSONResponse({"ok": True, "token": token, "username": user["username"]}, status_code=200)
 
     except ValueError as ve:
-        return JSONResponse({"ok": False, "error": str(ve)}, status_code=409)
+        msg = str(ve)
+        code = 409 if "taken" in msg else 400
+        return JSONResponse({"ok": False, "error": msg}, status_code=code)
     except Exception:
         return JSONResponse({"ok": False, "error": "signup failed", "detail": traceback.format_exc()}, status_code=500)
 
@@ -213,17 +219,18 @@ async def broadcast(payload: dict, exclude: Optional[WebSocket] = None):
 
 
 # =====================
-# WS
+# WS endpoint
 # =====================
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
-    authed_username = None
+    authed_username: Optional[str] = None
 
     try:
         while True:
             data = await websocket.receive_json()
             t = (data.get("type") or "").strip()
 
+            # ---------- AUTH ----------
             if t == "auth":
                 token = (data.get("token") or "").strip()
                 u = username_from_token(token)
@@ -236,6 +243,7 @@ async def ws_endpoint(websocket: WebSocket):
 
                 authed_username = u
                 connected_users[u] = websocket
+
                 await websocket.send_json({"type": "success", "message": "Registered", "users": list(connected_users.keys())})
                 await broadcast({"type": "user_joined", "username": u}, exclude=websocket)
                 continue
@@ -244,49 +252,128 @@ async def ws_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "Not authorized"})
                 continue
 
+            # ---------- PRIVATE MESSAGE ----------
             if t == "message":
                 to_user = (data.get("to") or "").strip()
                 text = (data.get("text") or "").strip()
-                client_id = (data.get("client_id") or "").strip() or None
+
+                # ✅ КЛЮЧЕВОЕ: сервер использует ID клиента, чтобы edit/delete работали у обоих
+                msg_id = (data.get("id") or "").strip()
+                if not msg_id:
+                    msg_id = new_id("m")
+
                 if not to_user or not text:
                     continue
 
-                msg_id = new_id("m")
-                payload = {"type": "pm", "id": msg_id, "from": authed_username, "to": to_user, "text": text, "ts": int(time.time())}
-                ok = await send_to(to_user, payload)
+                payload = {
+                    "type": "pm",
+                    "id": msg_id,
+                    "from": authed_username,
+                    "to": to_user,
+                    "text": text,
+                    "ts": int(time.time()),
+                }
 
+                ok = await send_to(to_user, payload)
                 if ok:
-                    await websocket.send_json({"type": "pm_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
+                    await websocket.send_json({"type": "pm_sent", "id": msg_id, "to": to_user, "ts": payload["ts"]})
                 else:
-                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
+                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
                 continue
 
+            # ---------- VOICE ----------
             if t == "voice":
                 to_user = (data.get("to") or "").strip()
                 b64 = data.get("b64") or ""
                 sr = int(data.get("sr", 16000))
                 ch = int(data.get("ch", 1))
-                client_id = (data.get("client_id") or "").strip() or None
+
+                msg_id = (data.get("id") or "").strip()
+                if not msg_id:
+                    msg_id = new_id("v")
+
                 if not to_user or not b64:
                     continue
 
-                msg_id = new_id("v")
-                payload = {"type": "voice", "id": msg_id, "from": authed_username, "to": to_user, "b64": b64, "sr": sr, "ch": ch, "ts": int(time.time())}
-                ok = await send_to(to_user, payload)
+                payload = {
+                    "type": "voice",
+                    "id": msg_id,
+                    "from": authed_username,
+                    "to": to_user,
+                    "b64": b64,
+                    "sr": sr,
+                    "ch": ch,
+                    "ts": int(time.time()),
+                }
 
+                ok = await send_to(to_user, payload)
                 if ok:
-                    await websocket.send_json({"type": "voice_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
+                    await websocket.send_json({"type": "voice_sent", "id": msg_id, "to": to_user, "ts": payload["ts"]})
                 else:
-                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
+                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
                 continue
 
+            # ---------- PRESENCE ----------
             if t == "presence":
                 kind = (data.get("kind") or "").strip()
                 is_on = bool(data.get("is_on", False))
                 to_user = (data.get("to") or "").strip()
-                if kind not in ("typing", "recording") or not to_user:
+
+                if kind not in ("typing", "recording"):
                     continue
-                await send_to(to_user, {"type": "presence", "kind": kind, "from": authed_username, "is_on": is_on, "to": to_user})
+                if not to_user:
+                    continue
+
+                payload = {
+                    "type": "presence",
+                    "kind": kind,
+                    "from": authed_username,
+                    "to": to_user,
+                    "is_on": is_on,
+                }
+                await send_to(to_user, payload)
+                continue
+
+            # ---------- EDIT MESSAGE (text only) ----------
+            if t == "edit":
+                to_user = (data.get("to") or "").strip()
+                msg_id = (data.get("id") or "").strip()
+                new_text = (data.get("new_text") or "").strip()
+                if not to_user or not msg_id or not new_text:
+                    continue
+
+                payload = {
+                    "type": "edit",
+                    "id": msg_id,
+                    "from": authed_username,
+                    "to": to_user,
+                    "new_text": new_text,
+                    "edited_ts": int(time.time()),
+                }
+
+                # отправляем ОБОИМ
+                await send_to(to_user, payload)
+                await websocket.send_json(payload)
+                continue
+
+            # ---------- DELETE FOR BOTH ----------
+            if t == "delete_for_both":
+                to_user = (data.get("to") or "").strip()
+                msg_id = (data.get("id") or "").strip()
+                if not to_user or not msg_id:
+                    continue
+
+                payload = {
+                    "type": "delete_for_both",
+                    "id": msg_id,
+                    "from": authed_username,
+                    "to": to_user,
+                    "ts": int(time.time()),
+                }
+
+                # отправляем ОБОИМ
+                await send_to(to_user, payload)
+                await websocket.send_json(payload)
                 continue
 
     except Exception:
