@@ -13,7 +13,6 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
-
 # =====================
 # ENV
 # =====================
@@ -22,20 +21,19 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "dev_secret_change_me")
 JWT_ALG = os.environ.get("JWT_ALG", "HS256")
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "2592000"))  # 30 days
 
-# =====================
-# PASSWORD HASHING
-# - pbkdf2_sha256: no 72-byte limit
-# - bcrypt: keep compatibility if you already have bcrypt hashes in DB
-# =====================
+# Password hashing (no 72-byte limit) + allow old bcrypt hashes if exist
 pwd_context = CryptContext(
     schemes=["pbkdf2_sha256", "bcrypt"],
     deprecated="auto",
 )
 
 # =====================
-# WS STATE
+# DB + WS STATE
 # =====================
+pool: Optional[asyncpg.Pool] = None
 connected_users: Dict[str, WebSocket] = {}
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 
 def now_ts() -> int:
@@ -44,76 +42,6 @@ def now_ts() -> int:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
-
-
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-# =====================
-# DB
-# =====================
-pool: Optional[asyncpg.Pool] = None
-
-
-async def init_db():
-    """
-    Creates users table if not exists.
-    """
-    global pool
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                email TEXT UNIQUE NOT NULL,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at BIGINT NOT NULL
-            );
-            """
-        )
-
-
-async def db_create_user(email: str, username: str, password: str) -> dict:
-    if pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
-    password_hash = pwd_context.hash(password)
-
-    async with pool.acquire() as conn:
-        try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO users(email, username, password_hash, created_at)
-                VALUES($1, $2, $3, $4)
-                RETURNING id, email, username, created_at
-                """,
-                email, username, password_hash, now_ts(),
-            )
-            return dict(row)
-        except asyncpg.UniqueViolationError:
-            raise ValueError("email or username already taken")
-
-
-async def db_get_user_by_email(email: str) -> Optional[dict]:
-    if pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE email=$1", email)
-        return dict(row) if row else None
-
-
-async def db_get_user_by_username(username: str) -> Optional[dict]:
-    if pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE username=$1", username)
-        return dict(row) if row else None
 
 
 # =====================
@@ -136,6 +64,62 @@ def username_from_token(token: str) -> Optional[str]:
 
 
 # =====================
+# DB
+# =====================
+async def init_db():
+    global pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with pool.acquire() as conn:
+        # ВАЖНО: email НЕ unique (может повторяться). Уникальный только username.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email TEXT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at BIGINT NOT NULL
+            );
+            """
+        )
+        # индексы на всякий
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
+
+
+async def db_get_user_by_username(username: str) -> Optional[dict]:
+    if pool is None:
+        raise RuntimeError("DB pool is not initialized")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE username=$1", username)
+        return dict(row) if row else None
+
+
+async def db_create_user(email: Optional[str], username: str, password: str) -> dict:
+    if pool is None:
+        raise RuntimeError("DB pool is not initialized")
+
+    password_hash = pwd_context.hash(password)
+
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users(email, username, password_hash, created_at)
+                VALUES($1, $2, $3, $4)
+                RETURNING id, email, username, created_at
+                """,
+                email, username, password_hash, now_ts(),
+            )
+            return dict(row)
+        except asyncpg.UniqueViolationError:
+            raise ValueError("username already taken")
+
+
+# =====================
 # HTTP ROUTES
 # =====================
 async def homepage(request):
@@ -145,17 +129,16 @@ async def homepage(request):
 async def signup(request):
     """
     POST /signup
-    JSON: { "email": "...", "username": "...", "password": "..." }
+    JSON: {"email":"(optional)", "username":"...", "password":"..."}
+    email НЕ проверяем на уникальность и не валидируем строго.
     """
     try:
         body = await request.json()
-        email = (body.get("email") or "").strip().lower()
+        email = (body.get("email") or "").strip() or None
         username = (body.get("username") or "").strip()
         password = body.get("password") or ""
 
-        if not EMAIL_RE.match(email):
-            return JSONResponse({"ok": False, "error": "invalid email"}, status_code=400)
-        if not (3 <= len(username) <= 20) or not re.match(r"^[A-Za-z0-9_]+$", username):
+        if not USERNAME_RE.match(username):
             return JSONResponse({"ok": False, "error": "invalid username (3-20, A-Z 0-9 _)"}, status_code=400)
         if len(password) < 6:
             return JSONResponse({"ok": False, "error": "password too short (min 6)"}, status_code=400)
@@ -173,14 +156,14 @@ async def signup(request):
 async def login(request):
     """
     POST /login
-    JSON: { "email": "...", "password": "..." }
+    JSON: {"username":"...", "password":"..."}
     """
     try:
         body = await request.json()
-        email = (body.get("email") or "").strip().lower()
+        username = (body.get("username") or "").strip()
         password = body.get("password") or ""
 
-        user = await db_get_user_by_email(email)
+        user = await db_get_user_by_username(username)
         if not user:
             return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
 
@@ -217,7 +200,6 @@ async def broadcast(payload: dict, exclude: Optional[WebSocket] = None):
 # =====================
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
-
     authed_username = None
 
     try:
@@ -225,139 +207,89 @@ async def ws_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             t = (data.get("type") or "").strip()
 
-            # ---- AUTH ----
+            # --- auth ---
             if t == "auth":
                 token = (data.get("token") or "").strip()
                 u = username_from_token(token)
                 if not u:
                     await websocket.send_json({"type": "error", "message": "Invalid token"})
                     continue
-
                 if u in connected_users:
                     await websocket.send_json({"type": "error", "message": "User already online"})
                     continue
 
                 authed_username = u
                 connected_users[u] = websocket
-
-                await websocket.send_json({
-                    "type": "success",
-                    "message": "Registered",
-                    "users": list(connected_users.keys()),
-                })
+                await websocket.send_json({"type": "success", "message": "Registered", "users": list(connected_users.keys())})
                 await broadcast({"type": "user_joined", "username": u}, exclude=websocket)
                 continue
 
-            # block everything until auth
             if not authed_username:
                 await websocket.send_json({"type": "error", "message": "Not authorized"})
                 continue
 
-            # ---- TEXT ----
+            # --- message ---
             if t == "message":
                 to_user = (data.get("to") or "").strip()
                 text = (data.get("text") or "").strip()
                 client_id = (data.get("client_id") or "").strip() or None
-
                 if not to_user or not text:
                     continue
 
                 msg_id = new_id("m")
-                payload = {
-                    "type": "pm",
-                    "id": msg_id,
-                    "from": authed_username,
-                    "to": to_user,
-                    "text": text,
-                    "ts": now_ts(),
-                }
+                payload = {"type": "pm", "id": msg_id, "from": authed_username, "to": to_user, "text": text, "ts": now_ts()}
 
                 ok = await send_to(to_user, payload)
                 if ok:
-                    await websocket.send_json({
-                        "type": "pm_sent",
-                        "id": msg_id,
-                        "to": to_user,
-                        "ts": payload["ts"],
-                        "client_id": client_id,
-                    })
+                    await websocket.send_json({"type": "pm_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
                 else:
-                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
+                    # ВАЖНО: client_id возвращаем чтобы клиент поставил в очередь
+                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
                 continue
 
-            # ---- VOICE ----
+            # --- voice ---
             if t == "voice":
                 to_user = (data.get("to") or "").strip()
                 b64 = data.get("b64") or ""
                 sr = int(data.get("sr", 16000))
                 ch = int(data.get("ch", 1))
                 client_id = (data.get("client_id") or "").strip() or None
-
                 if not to_user or not b64:
                     continue
 
                 msg_id = new_id("v")
-                payload = {
-                    "type": "voice",
-                    "id": msg_id,
-                    "from": authed_username,
-                    "to": to_user,
-                    "b64": b64,
-                    "sr": sr,
-                    "ch": ch,
-                    "ts": now_ts(),
-                }
+                payload = {"type": "voice", "id": msg_id, "from": authed_username, "to": to_user, "b64": b64, "sr": sr, "ch": ch, "ts": now_ts()}
 
                 ok = await send_to(to_user, payload)
                 if ok:
-                    await websocket.send_json({
-                        "type": "voice_sent",
-                        "id": msg_id,
-                        "to": to_user,
-                        "ts": payload["ts"],
-                        "client_id": client_id,
-                    })
+                    await websocket.send_json({"type": "voice_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
                 else:
-                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
+                    await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
                 continue
 
-            # ---- PRESENCE ----
+            # --- presence ---
             if t == "presence":
                 kind = (data.get("kind") or "").strip()
                 is_on = bool(data.get("is_on", False))
                 to_user = (data.get("to") or "").strip()
                 if kind not in ("typing", "recording") or not to_user:
                     continue
-                await send_to(to_user, {
-                    "type": "presence",
-                    "kind": kind,
-                    "from": authed_username,
-                    "is_on": is_on,
-                    "to": to_user,
-                })
+                await send_to(to_user, {"type": "presence", "kind": kind, "from": authed_username, "is_on": is_on, "to": to_user})
                 continue
 
-            # ---- EDIT TEXT (for both) ----
+            # --- edit ---
             if t == "edit":
                 to_user = (data.get("to") or "").strip()
                 msg_id = (data.get("id") or "").strip()
                 new_text = (data.get("new_text") or "").strip()
                 if not to_user or not msg_id or not new_text:
                     continue
-
-                payload = {
-                    "type": "edit",
-                    "id": msg_id,
-                    "from": authed_username,
-                    "to": to_user,
-                    "new_text": new_text,
-                    "edited_ts": now_ts(),
-                }
+                payload = {"type": "edit", "id": msg_id, "from": authed_username, "to": to_user, "new_text": new_text, "edited_ts": now_ts()}
                 await send_to(to_user, payload)
                 await websocket.send_json(payload)
                 continue
 
-            # ---- DELETE FOR BOTH ----
+            # --- delete for both ---
             if t == "delete_for_both":
                 to_user = (data.get("to") or "").strip()
                 msg_id = (data.get("id") or "").strip()
@@ -368,19 +300,13 @@ async def ws_endpoint(websocket: WebSocket):
                 await websocket.send_json(payload)
                 continue
 
-            # ---- READ RECEIPT ----
+            # --- read receipts ---
             if t == "read":
                 to_user = (data.get("to") or "").strip()
                 upto_id = (data.get("upto_id") or "").strip()
                 if not to_user or not upto_id:
                     continue
-                await send_to(to_user, {
-                    "type": "read",
-                    "from": authed_username,
-                    "to": to_user,
-                    "upto_id": upto_id,
-                    "ts": now_ts(),
-                })
+                await send_to(to_user, {"type": "read", "from": authed_username, "to": to_user, "upto_id": upto_id, "ts": now_ts()})
                 continue
 
     except Exception:
@@ -391,9 +317,6 @@ async def ws_endpoint(websocket: WebSocket):
             await broadcast({"type": "user_left", "username": authed_username})
 
 
-# =====================
-# LIFESPAN
-# =====================
 async def on_startup():
     await init_db()
 
