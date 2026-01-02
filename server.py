@@ -67,6 +67,10 @@ def username_from_token(token: str) -> Optional[str]:
 # DB
 # =====================
 async def init_db():
+    """
+    Creates users table if not exists.
+    IMPORTANT: email is NOT unique (we migrate old unique constraint away).
+    """
     global pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
@@ -74,7 +78,7 @@ async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with pool.acquire() as conn:
-        # ВАЖНО: email НЕ unique (может повторяться). Уникальный только username.
+        # Create table (email is NOT unique)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -86,7 +90,17 @@ async def init_db():
             );
             """
         )
-        # индексы на всякий
+
+        # ---- MIGRATION: remove old UNIQUE constraint/index on email (if existed) ----
+        # Postgres typical constraint name for UNIQUE(email) is users_email_key
+        await conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;")
+        await conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_unique;")
+
+        # Also drop possible unique index names (just in case)
+        await conn.execute("DROP INDEX IF EXISTS users_email_key;")
+        await conn.execute("DROP INDEX IF EXISTS idx_users_email_unique;")
+
+        # Create non-unique index to speed up lookups (optional)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
 
 
@@ -243,7 +257,6 @@ async def ws_endpoint(websocket: WebSocket):
                 if ok:
                     await websocket.send_json({"type": "pm_sent", "id": msg_id, "to": to_user, "ts": payload["ts"], "client_id": client_id})
                 else:
-                    # ВАЖНО: client_id возвращаем чтобы клиент поставил в очередь
                     await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online", "client_id": client_id})
                 continue
 
@@ -317,6 +330,9 @@ async def ws_endpoint(websocket: WebSocket):
             await broadcast({"type": "user_left", "username": authed_username})
 
 
+# =====================
+# LIFESPAN
+# =====================
 async def on_startup():
     await init_db()
 
