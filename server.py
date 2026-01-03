@@ -1,17 +1,97 @@
 from starlette.applications import Starlette
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
+import os
+import time
+import base64
+import hashlib
+import hmac
+
+
 connected_users: dict[str, WebSocket] = {}
+
+# -------------------------
+# SIMPLE IN-MEMORY AUTH
+# -------------------------
+# username -> {"email": str, "salt": bytes, "hash": bytes, "created_at": int}
+USERS: dict[str, dict] = {}
+
+
+def _hash_password(password: str, salt: bytes) -> bytes:
+    # stable + safe enough for MVP without extra deps
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+
+
+def _make_token(username: str) -> str:
+    # token сейчас клиенту нужен только чтобы "был"
+    raw = f"{username}:{int(time.time())}:{base64.urlsafe_b64encode(os.urandom(16)).decode('ascii')}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
 
 async def homepage(request):
     return PlainTextResponse("OK - Lightning server is running")
+
+
+async def signup(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    email = (data.get("email") or "").strip()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    if not username or not password:
+        return JSONResponse({"ok": False, "error": "username and password required"}, status_code=400)
+
+    # email НЕ проверяем на уникальность (как ты просил), но username — должен быть уникальный
+    if username in USERS:
+        return JSONResponse({"ok": False, "error": "username already taken"}, status_code=409)
+
+    salt = os.urandom(16)
+    pwd_hash = _hash_password(password, salt)
+
+    USERS[username] = {
+        "email": email,
+        "salt": salt,
+        "hash": pwd_hash,
+        "created_at": int(time.time()),
+    }
+
+    return JSONResponse({"ok": True, "token": _make_token(username), "username": username}, status_code=200)
+
+
+async def login(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    user = USERS.get(username)
+    if not user:
+        return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
+
+    salt = user["salt"]
+    expected = user["hash"]
+    got = _hash_password(password, salt)
+
+    if not hmac.compare_digest(expected, got):
+        return JSONResponse({"ok": False, "error": "invalid credentials"}, status_code=401)
+
+    return JSONResponse({"ok": True, "token": _make_token(username), "username": username}, status_code=200)
+
 
 async def broadcast(payload: dict, exclude: WebSocket | None = None):
     for ws in list(connected_users.values()):
         if ws is not exclude:
             await ws.send_json(payload)
+
 
 async def send_to(username: str, payload: dict) -> bool:
     ws = connected_users.get(username)
@@ -65,8 +145,6 @@ async def ws_endpoint(websocket: WebSocket):
                 if ok:
                     await websocket.send_json({"type": "pm_sent", "to": to_user, "id": msg_id, "ts": ts})
                 else:
-                    # важно: НЕ ломаем отправку "в оффлайн" на сервере (у тебя нет БД сообщений),
-                    # поэтому просто говорим, что пользователь не в сети.
                     await websocket.send_json({"type": "error", "message": f"User @{to_user} is not online"})
 
             # ---------- voice (PM only) ----------
@@ -172,5 +250,7 @@ async def ws_endpoint(websocket: WebSocket):
 
 app = Starlette(routes=[
     Route("/", homepage),
+    Route("/signup", signup, methods=["POST"]),
+    Route("/login", login, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ])
