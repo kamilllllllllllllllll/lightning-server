@@ -4,3 +4,4 @@ asyncpg
 PyJWT
 passlib
 python-dotenv
+websocket-client
